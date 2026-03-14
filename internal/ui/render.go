@@ -15,6 +15,8 @@ type DiskBrowserState struct {
 	Node     domain.DiskNode
 	Selected int
 	Loading  bool
+	Progress domain.DiskScanProgress
+	Cleanup  domain.CleanupProgress
 }
 
 func RenderDashboard(styles Styles, width int, focus int, data domain.DashboardData, disk DiskBrowserState) string {
@@ -30,7 +32,7 @@ func RenderDashboard(styles Styles, width int, focus int, data domain.DashboardD
 		panel(styles, 3 == focus, leftWidth-leftWidth/2, "Network", renderThroughput(data.Network, "RX", "TX")),
 	)
 
-	right := panel(styles, 4 == focus, rightWidth, "Disk Browser", renderDiskPreview(styles, disk))
+	right := panel(styles, 4 == focus, rightWidth, "Disk Space", renderDiskPreview(styles, data.DiskUsage, disk))
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top,
 		lipgloss.JoinVertical(lipgloss.Left, leftTop, leftBottom),
@@ -44,7 +46,7 @@ func RenderDashboard(styles Styles, width int, focus int, data domain.DashboardD
 	return lipgloss.JoinVertical(lipgloss.Left, body, "", styles.StatusLine.Render(status))
 }
 
-func RenderProcessTable(styles Styles, width, height int, title string, processes []domain.ProcessInfo, selected int, sortBy, query string) string {
+func RenderProcessTable(styles Styles, width, height int, title string, processes []domain.ProcessInfo, selected int, query string) string {
 	var lines []string
 	nameWidth, stateWidth, cmdWidth, ruleWidth := processTableWidths(width)
 	start, end := windowBounds(len(processes), selected, visibleRows(height, 7))
@@ -54,7 +56,7 @@ func RenderProcessTable(styles Styles, width, height int, title string, processe
 	} else {
 		lines = append(lines, styles.Dim.Render("Filter: type to search, backspace deletes"))
 	}
-	lines = append(lines, fmt.Sprintf("%-8s %-*s %-9s %-10s %-*s %s", "PID", nameWidth, "NAME", sortBy, "RSS", stateWidth, "STATE", "CMD"))
+	lines = append(lines, fmt.Sprintf("%-8s %-*s %-9s %-10s %-*s %s", "PID", nameWidth, "NAME", "CPU%", "RSS", stateWidth, "STATE", "CMD"))
 	lines = append(lines, styles.Dim.Render(strings.Repeat("─", ruleWidth)))
 	for i := start; i < end; i++ {
 		p := processes[i]
@@ -63,7 +65,7 @@ func RenderProcessTable(styles Styles, width, height int, title string, processe
 			p.PID,
 			nameWidth,
 			truncate(p.Name, nameWidth),
-			processSortValue(p, sortBy),
+			cpuString(p.CPU),
 			byteString(p.RSS),
 			stateWidth,
 			truncate(p.Status, stateWidth),
@@ -112,15 +114,33 @@ func RenderConnections(styles Styles, width, height int, conns []domain.Connecti
 	return strings.Join(lines, "\n")
 }
 
-func RenderDiskBrowser(styles Styles, width, height int, state DiskBrowserState) string {
+func RenderDiskBrowser(styles Styles, width, height int, usage domain.DiskUsage, state DiskBrowserState) string {
 	var lines []string
 	nameWidth, barWidth, ruleWidth := diskBrowserWidths(width)
 	start, end := windowBounds(len(state.Node.Children), state.Selected, visibleRows(height, 7))
-	title := "Disk Browser: " + state.Path
+	title := "Disk Space Browser: " + state.Path
 	if state.Loading {
 		title += " [scanning]"
 	}
 	lines = append(lines, styles.Title.Render(title))
+	lines = append(lines, styles.Dim.Render(fmt.Sprintf("Filesystem  %s used of %s  (%4.1f%%)", byteString(usage.Used), byteString(usage.Total), usage.UsedPercent)))
+	lines = append(lines, styles.Dim.Render(pctBar(styles, max(24, min(48, width-20)), usage.UsedPercent)))
+	if state.Node.Size > 0 {
+		lines = append(lines, fmt.Sprintf("Scanned path total  %s", byteString(state.Node.Size)))
+	} else if state.Loading {
+		lines = append(lines, "Scanned path total  calculating...")
+	}
+	if state.Cleanup.Running || state.Cleanup.Done {
+		lines = append(lines, "")
+		lines = append(lines, renderCleanupProgress(styles, width, state.Cleanup))
+	}
+	if state.Loading && state.Progress.Total > 0 {
+		progressPct := (float64(state.Progress.Completed) / float64(state.Progress.Total)) * 100
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("Scan progress  %d/%d  %s", state.Progress.Completed, state.Progress.Total, truncate(state.Progress.Current, max(20, width-36))))
+		lines = append(lines, pctBar(styles, max(24, min(48, width-20)), progressPct))
+	}
+	lines = append(lines, "")
 	lines = append(lines, fmt.Sprintf("%-*s %10s %8s %s", nameWidth, "NAME", "SIZE", "PCT", "BAR"))
 	lines = append(lines, styles.Dim.Render(strings.Repeat("─", ruleWidth)))
 	for i := start; i < end; i++ {
@@ -145,7 +165,7 @@ func RenderDiskBrowser(styles Styles, width, height int, state DiskBrowserState)
 	}
 	lines = append(lines, "")
 	lines = append(lines, styles.Dim.Render(fmt.Sprintf("rows %d-%d of %d", start+1, max(start+1, end), len(state.Node.Children))))
-	lines = append(lines, styles.Dim.Render("enter descend  backspace up  * partial size due to permissions/device boundary"))
+	lines = append(lines, styles.Dim.Render("enter/right descend  backspace/left up  f5 rescan current folder  f6 cleanup  percentages are of scanned path total"))
 	return strings.Join(lines, "\n")
 }
 
@@ -195,11 +215,23 @@ func renderThroughput(tp domain.Throughput, readLabel, writeLabel string) string
 	}, "\n")
 }
 
-func renderDiskPreview(styles Styles, disk DiskBrowserState) string {
+func renderDiskPreview(styles Styles, usage domain.DiskUsage, disk DiskBrowserState) string {
 	if disk.Loading && len(disk.Node.Children) == 0 {
-		return "Scanning..."
+		return strings.Join([]string{
+			fmt.Sprintf("%s used of %s", byteString(usage.Used), byteString(usage.Total)),
+			fmt.Sprintf("Usage    %5.1f%%", usage.UsedPercent),
+			pctBar(styles, 24, usage.UsedPercent),
+			"",
+			"Scanning...",
+		}, "\n")
 	}
-	lines := []string{styles.Dim.Render(disk.Path)}
+	lines := []string{
+		fmt.Sprintf("%s used of %s", byteString(usage.Used), byteString(usage.Total)),
+		fmt.Sprintf("Usage    %5.1f%%", usage.UsedPercent),
+		pctBar(styles, 24, usage.UsedPercent),
+		"",
+		styles.Dim.Render(disk.Path),
+	}
 	for i, child := range disk.Node.Children {
 		if i >= 8 {
 			break
@@ -220,11 +252,8 @@ func pctBar(styles Styles, width int, pct float64) string {
 	return styles.BarFull.Render(strings.Repeat("█", full)) + styles.BarEmpty.Render(strings.Repeat("░", width-full))
 }
 
-func processSortValue(p domain.ProcessInfo, sortBy string) string {
-	if sortBy == "CPU%" {
-		return fmt.Sprintf("%5.1f%%", p.CPU)
-	}
-	return byteString(p.RSS)
+func cpuString(v float64) string {
+	return fmt.Sprintf("%5.1f%%", v)
 }
 
 func byteString(v uint64) string {
@@ -239,6 +268,42 @@ func byteString(v uint64) string {
 		return fmt.Sprintf("%d%s", v, units[unit])
 	}
 	return fmt.Sprintf("%.1f%s", f, units[unit])
+}
+
+func ByteString(v uint64) string {
+	return byteString(v)
+}
+
+func renderCleanupProgress(styles Styles, width int, progress domain.CleanupProgress) string {
+	lines := []string{
+		styles.Warn.Render("Cleanup"),
+	}
+	total := max(1, progress.Total)
+	pct := (float64(progress.Completed) / float64(total)) * 100
+	status := fmt.Sprintf("%d/%d", progress.Completed, progress.Total)
+	if progress.CurrentStep != "" {
+		status += "  " + progress.CurrentStep
+	}
+	if progress.Done {
+		status = fmt.Sprintf("saved %s", byteString(progress.SavedBytes))
+		if progress.AfterFree > 0 {
+			status += fmt.Sprintf("  free %s -> %s", byteString(progress.BeforeFree), byteString(progress.AfterFree))
+		}
+	}
+	lines = append(lines, status)
+	lines = append(lines, pctBar(styles, max(24, min(48, width-20)), pct))
+	for _, result := range progress.Results {
+		label := "ok"
+		if !result.OK {
+			label = "failed"
+		}
+		line := fmt.Sprintf("%-26s %s", truncate(result.Name, 26), label)
+		if !result.OK && result.Detail != "" {
+			line += "  " + truncate(result.Detail, max(20, width-42))
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func truncate(s string, n int) string {

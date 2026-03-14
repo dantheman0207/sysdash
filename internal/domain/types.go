@@ -80,3 +80,34 @@ type DiskNode struct {
 	Children  []DiskEntry
 	ScannedAt time.Time
 }
+
+type DiskScanProgress struct {
+	Root      string
+	Current   string
+	Completed int
+	Total     int
+	StartedAt time.Time
+	Done      bool
+}
+
+type CleanupStepResult struct {
+	Name    string
+	OK      bool
+	Detail  string
+	Started time.Time
+	Ended   time.Time
+}
+
+type CleanupProgress struct {
+	Running     bool
+	Done        bool
+	Completed   int
+	Total       int
+	CurrentStep string
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	BeforeFree  uint64
+	AfterFree   uint64
+	SavedBytes  uint64
+	Results     []CleanupStepResult
+}

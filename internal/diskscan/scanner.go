@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,12 +18,25 @@ type Scanner struct {
 	mu       sync.RWMutex
 	cache    map[string]domain.DiskNode
 	inflight map[string]bool
+	progress map[string]domain.DiskScanProgress
+}
+
+type fileID struct {
+	dev uint64
+	ino uint64
+}
+
+type scanState struct {
+	rootDev uint64
+	root    string
+	seen    map[fileID]struct{}
 }
 
 func New() *Scanner {
 	return &Scanner{
 		cache:    make(map[string]domain.DiskNode),
 		inflight: make(map[string]bool),
+		progress: make(map[string]domain.DiskScanProgress),
 	}
 }
 
@@ -39,56 +53,126 @@ func (s *Scanner) IsInflight(path string) bool {
 	return s.inflight[path]
 }
 
+func (s *Scanner) Progress(path string) (domain.DiskScanProgress, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.progress[path]
+	return p, ok
+}
+
 func (s *Scanner) Scan(ctx context.Context, path string) (domain.DiskNode, error) {
+	return s.scan(ctx, path, false)
+}
+
+func (s *Scanner) ForceScan(ctx context.Context, path string) (domain.DiskNode, error) {
+	return s.scan(ctx, path, true)
+}
+
+func (s *Scanner) scan(ctx context.Context, path string, force bool) (domain.DiskNode, error) {
 	s.mu.Lock()
-	if node, ok := s.cache[path]; ok {
-		s.mu.Unlock()
-		return node, nil
+	if !force {
+		if node, ok := s.cache[path]; ok {
+			s.mu.Unlock()
+			return node, nil
+		}
 	}
 	if s.inflight[path] {
 		s.mu.Unlock()
 		return domain.DiskNode{Path: path}, nil
 	}
+	if force {
+		s.clearCacheUnder(path)
+	}
 	s.inflight[path] = true
+	s.progress[path] = domain.DiskScanProgress{
+		Root:      path,
+		StartedAt: time.Now(),
+		Total:     1,
+	}
 	s.mu.Unlock()
 
-	node, err := scanPath(ctx, path, deviceID(path))
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.inflight, path)
-	if err == nil {
-		s.cache[path] = node
-	}
-	return node, err
-}
-
-func scanPath(ctx context.Context, path string, rootDev uint64) (domain.DiskNode, error) {
-	entries, err := os.ReadDir(path)
+	rootInfo, err := os.Lstat(path)
 	if err != nil {
+		s.mu.Lock()
+		delete(s.inflight, path)
+		delete(s.progress, path)
+		s.mu.Unlock()
 		return domain.DiskNode{}, err
 	}
 
-	node := domain.DiskNode{Path: path, ScannedAt: time.Now()}
+	state := scanState{
+		rootDev: statDevice(rootInfo),
+		root:    path,
+		seen:    make(map[fileID]struct{}),
+	}
+	if id, ok := statFileID(rootInfo); ok {
+		state.seen[id] = struct{}{}
+	}
+
+	node, _, err := s.scanRecursive(ctx, path, path, state)
+
+	s.mu.Lock()
+	delete(s.inflight, path)
+	if p, ok := s.progress[path]; ok {
+		p.Done = true
+		if p.Total < p.Completed {
+			p.Total = p.Completed
+		}
+		s.progress[path] = p
+	}
+	s.mu.Unlock()
+
+	if err != nil {
+		return domain.DiskNode{}, err
+	}
+	return node, nil
+}
+
+func (s *Scanner) scanRecursive(ctx context.Context, root, path string, state scanState) (domain.DiskNode, bool, error) {
+	select {
+	case <-ctx.Done():
+		return domain.DiskNode{}, true, ctx.Err()
+	default:
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return domain.DiskNode{}, true, err
+	}
+
+	node := domain.DiskNode{
+		Path:      path,
+		ScannedAt: time.Now(),
+		Children:  make([]domain.DiskEntry, 0, len(entries)),
+	}
+	var incomplete bool
+	s.addProgressTotal(root, len(entries))
+
 	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
-			return domain.DiskNode{}, ctx.Err()
+			return domain.DiskNode{}, true, ctx.Err()
 		default:
 		}
 
 		full := filepath.Join(path, entry.Name())
-		size, incomplete := dirSize(ctx, full, rootDev)
-		child := domain.DiskEntry{
+		s.setProgressCurrent(root, full)
+		child, childIncomplete, err := s.scanEntry(ctx, root, full, state)
+		if err != nil && !IsCanceled(err) {
+			childIncomplete = true
+		}
+		node.Children = append(node.Children, domain.DiskEntry{
 			Name:       entry.Name(),
 			Path:       full,
-			Size:       size,
-			IsDir:      entry.IsDir(),
+			Size:       child.Size,
+			IsDir:      child.IsDir,
+			Percent:    0,
 			ScannedAt:  node.ScannedAt,
-			Incomplete: incomplete,
-		}
-		node.Children = append(node.Children, child)
-		node.Size += size
+			Incomplete: childIncomplete,
+		})
+		node.Size += child.Size
+		incomplete = incomplete || childIncomplete
+		s.incrementProgress(root)
 	}
 
 	sort.Slice(node.Children, func(i, j int) bool {
@@ -104,53 +188,89 @@ func scanPath(ctx context.Context, path string, rootDev uint64) (domain.DiskNode
 		}
 	}
 
-	return node, nil
+	s.mu.Lock()
+	s.cache[path] = node
+	s.mu.Unlock()
+
+	return node, incomplete, nil
 }
 
-func dirSize(ctx context.Context, path string, rootDev uint64) (uint64, bool) {
+type scanResult struct {
+	Size  uint64
+	IsDir bool
+}
+
+func (s *Scanner) scanEntry(ctx context.Context, root, path string, state scanState) (scanResult, bool, error) {
+	if shouldSkipPath(state.root, path) {
+		return scanResult{Size: 0, IsDir: true}, true, nil
+	}
+
 	info, err := os.Lstat(path)
 	if err != nil {
-		return 0, true
+		return scanResult{}, true, err
 	}
-	if !info.IsDir() {
-		return uint64(info.Size()), false
-	}
+
+	// Never follow symlinks; they are cheap to show but unsafe to recurse.
 	if info.Mode()&os.ModeSymlink != 0 {
-		return 0, true
+		return scanResult{Size: 0, IsDir: false}, true, nil
 	}
 
-	if dev := statDevice(info); rootDev != 0 && dev != 0 && dev != rootDev {
-		return 0, true
+	if dev := statDevice(info); state.rootDev != 0 && dev != 0 && dev != state.rootDev {
+		return scanResult{Size: 0, IsDir: info.IsDir()}, true, nil
 	}
 
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return 0, true
-	}
-
-	var total uint64
-	var incomplete bool
-	for _, entry := range entries {
-		select {
-		case <-ctx.Done():
-			return total, true
-		default:
+	if id, ok := statFileID(info); ok {
+		if _, seen := state.seen[id]; seen {
+			return scanResult{Size: 0, IsDir: info.IsDir()}, true, nil
 		}
-
-		child := filepath.Join(path, entry.Name())
-		size, childIncomplete := dirSize(ctx, child, rootDev)
-		total += size
-		incomplete = incomplete || childIncomplete
+		state.seen[id] = struct{}{}
 	}
-	return total, incomplete
+
+	if info.IsDir() && isDataless(info) {
+		return scanResult{Size: 0, IsDir: true}, false, nil
+	}
+
+	if !info.IsDir() {
+		return scanResult{Size: localSize(info), IsDir: false}, false, nil
+	}
+
+	node, incomplete, err := s.scanRecursive(ctx, root, path, state)
+	if err != nil {
+		return scanResult{}, true, err
+	}
+	return scanResult{Size: node.Size, IsDir: true}, incomplete, nil
 }
 
-func deviceID(path string) uint64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
+func (s *Scanner) clearCacheUnder(root string) {
+	for path := range s.cache {
+		if path == root || strings.HasPrefix(path, root+string(os.PathSeparator)) {
+			delete(s.cache, path)
+		}
 	}
-	return statDevice(info)
+}
+
+func (s *Scanner) addProgressTotal(root string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.progress[root]
+	p.Total += n
+	s.progress[root] = p
+}
+
+func (s *Scanner) setProgressCurrent(root, current string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.progress[root]
+	p.Current = current
+	s.progress[root] = p
+}
+
+func (s *Scanner) incrementProgress(root string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.progress[root]
+	p.Completed++
+	s.progress[root] = p
 }
 
 func statDevice(info os.FileInfo) uint64 {
@@ -159,6 +279,37 @@ func statDevice(info os.FileInfo) uint64 {
 		return 0
 	}
 	return uint64(stat.Dev)
+}
+
+func statFileID(info os.FileInfo) (fileID, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileID{}, false
+	}
+	return fileID{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, true
+}
+
+func statBlocksSize(info os.FileInfo) uint64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return uint64(info.Size())
+	}
+	// st_blocks is reported in 512-byte units on Darwin.
+	if stat.Blocks > 0 {
+		return uint64(stat.Blocks) * 512
+	}
+	return uint64(info.Size())
+}
+
+func shouldSkipPath(root, path string) bool {
+	if root != "/" {
+		return false
+	}
+	switch path {
+	case "/System/Volumes/Data":
+		return true
+	}
+	return strings.HasPrefix(path, "/System/Volumes/Data/")
 }
 
 func IsCanceled(err error) bool {

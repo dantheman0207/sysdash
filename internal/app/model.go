@@ -35,6 +35,14 @@ const (
 )
 
 type tickMsg struct{}
+type diskProgressMsg struct {
+	path     string
+	progress domain.DiskScanProgress
+	ok       bool
+}
+type cleanupProgressMsg struct {
+	progress domain.CleanupProgress
+}
 type snapshotMsg struct {
 	data domain.DashboardData
 	err  error
@@ -67,6 +75,7 @@ type keyMap struct {
 	Top     key.Binding
 	Bottom  key.Binding
 	Refresh key.Binding
+	Cleanup key.Binding
 	Quit    key.Binding
 	Back    key.Binding
 	Yes     key.Binding
@@ -86,8 +95,9 @@ func newKeyMap() keyMap {
 		Top:     key.NewBinding(key.WithKeys("home")),
 		Bottom:  key.NewBinding(key.WithKeys("end")),
 		Refresh: key.NewBinding(key.WithKeys("f5")),
+		Cleanup: key.NewBinding(key.WithKeys("f6")),
 		Quit:    key.NewBinding(key.WithKeys("ctrl+c")),
-		Back:    key.NewBinding(key.WithKeys("backspace")),
+		Back:    key.NewBinding(key.WithKeys("backspace", "ctrl+h")),
 		Yes:     key.NewBinding(key.WithKeys("y")),
 		No:      key.NewBinding(key.WithKeys("n")),
 	}
@@ -102,6 +112,7 @@ type Model struct {
 	data           domain.DashboardData
 	sampler        *collect.Sampler
 	scanner        *diskscan.Scanner
+	cleanupRunner  *actions.CleanupRunner
 	styles         ui.Styles
 	keys           keyMap
 	help           help.Model
@@ -115,6 +126,9 @@ type Model struct {
 	diskPath       string
 	diskNode       domain.DiskNode
 	diskLoading    bool
+	diskProgress   domain.DiskScanProgress
+	cleanupConfirm bool
+	cleanupState   domain.CleanupProgress
 	actionMenuPID  int32
 	actionMenuName string
 	confirmPID     int32
@@ -131,6 +145,7 @@ func New() Model {
 		view:          domain.ViewDashboard,
 		sampler:       collect.NewSampler(),
 		scanner:       diskscan.New(),
+		cleanupRunner: actions.NewCleanupRunner(),
 		styles:        ui.NewStyles(),
 		keys:          newKeyMap(),
 		help:          h,
@@ -141,7 +156,7 @@ func New() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.tickCmd(), m.refreshCmd(), m.scanDirCmd(m.diskPath))
+	return tea.Batch(m.tickCmd(), m.refreshCmd(), m.scanDirCmd(m.diskPath), m.diskProgressCmd(m.diskPath))
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -179,11 +194,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.err.Error()
 		}
 		if msg.path == m.diskPath && msg.err == nil {
-			m.diskNode = msg.node
-			m.selectedDisk = clamp(m.selectedDisk, len(m.diskNode.Children))
+			if len(msg.node.Children) > 0 || !m.scanner.IsInflight(msg.path) {
+				m.diskNode = msg.node
+				m.selectedDisk = clamp(m.selectedDisk, len(m.diskNode.Children))
+			}
 		}
 		if msg.path == m.diskPath {
-			m.diskLoading = false
+			m.diskLoading = m.scanner.IsInflight(msg.path)
+			if !m.diskLoading {
+				if p, ok := m.scanner.Progress(msg.path); ok {
+					m.diskProgress = p
+				}
+			}
+		}
+		return m, nil
+	case diskProgressMsg:
+		if msg.path == m.diskPath && msg.ok {
+			m.diskProgress = msg.progress
+			m.diskLoading = !msg.progress.Done
+			if !msg.progress.Done {
+				return m, m.diskProgressCmd(msg.path)
+			}
+		}
+		return m, nil
+	case cleanupProgressMsg:
+		m.cleanupState = msg.progress
+		if msg.progress.Running {
+			return m, m.cleanupProgressCmd()
+		}
+		if msg.progress.Done {
+			m.cleanupConfirm = false
+			status := fmt.Sprintf("cleanup finished, saved %s", ui.ByteString(msg.progress.SavedBytes))
+			failures := cleanupFailures(msg.progress.Results)
+			if failures > 0 {
+				status += fmt.Sprintf(" (%d step failures)", failures)
+			}
+			m.status = status
+			return m, tea.Batch(m.refreshCmd(), m.rescanDirCmd(m.diskPath), m.diskProgressCmd(m.diskPath))
 		}
 		return m, nil
 	case actionMsg:
@@ -200,6 +247,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		if key.Matches(msg, m.keys.Quit) {
 			return m, tea.Quit
+		}
+		if m.cleanupConfirm {
+			switch {
+			case key.Matches(msg, m.keys.Yes):
+				m.cleanupConfirm = false
+				if err := m.cleanupRunner.Start(context.Background()); err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				m.cleanupState = m.cleanupRunner.Progress()
+				m.status = "cleanup started"
+				return m, m.cleanupProgressCmd()
+			case key.Matches(msg, m.keys.No), key.Matches(msg, m.keys.Esc):
+				m.cleanupConfirm = false
+				m.status = "cleanup canceled"
+				return m, nil
+			default:
+				return m, nil
+			}
 		}
 		if m.actionMenuPID != 0 {
 			return m.handleActionMenu(msg)
@@ -228,7 +294,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case key.Matches(msg, m.keys.Refresh):
 			m.scheduleNextRefresh()
+			if m.view == domain.ViewDiskBrowser {
+				m.diskLoading = true
+				m.diskNode = domain.DiskNode{Path: m.diskPath}
+				m.selectedDisk = 0
+				return m, tea.Batch(m.refreshCmd(), m.rescanDirCmd(m.diskPath), m.diskProgressCmd(m.diskPath))
+			}
 			return m, tea.Batch(m.refreshCmd(), m.scanDirCmd(m.diskPath))
+		case key.Matches(msg, m.keys.Cleanup):
+			if m.view == domain.ViewDiskBrowser {
+				if m.cleanupState.Running {
+					m.status = "cleanup already running"
+					return m, nil
+				}
+				m.cleanupConfirm = true
+				return m, nil
+			}
+			return m, nil
 		case key.Matches(msg, m.keys.Tab):
 			if m.view == domain.ViewDashboard {
 				m.focus = (m.focus + 1) % focusCount
@@ -242,11 +324,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Left):
 			if m.view == domain.ViewDashboard {
 				m.focus = moveDashboardFocus(m.focus, "left")
+			} else if m.view == domain.ViewDiskBrowser {
+				return m.handleBack()
 			}
 			return m, nil
 		case key.Matches(msg, m.keys.Right):
 			if m.view == domain.ViewDashboard {
 				m.focus = moveDashboardFocus(m.focus, "right")
+			} else if m.view == domain.ViewDiskBrowser {
+				return m.handleEnter()
 			}
 			return m, nil
 		case key.Matches(msg, m.keys.Esc):
@@ -289,16 +375,18 @@ func (m Model) View() tea.View {
 		Node:     m.diskNode,
 		Selected: m.selectedDisk,
 		Loading:  m.diskLoading,
+		Progress: m.diskProgress,
+		Cleanup:  m.cleanupState,
 	}
 	switch m.view {
 	case domain.ViewCPU:
-		body = ui.RenderProcessTable(m.styles, m.width, m.height, "CPU Processes", m.filteredCPU(), m.selectedCPU, "CPU%", m.processFilter)
+		body = ui.RenderProcessTable(m.styles, m.width, m.height, "CPU Processes", m.filteredCPU(), m.selectedCPU, m.processFilter)
 	case domain.ViewMemory:
-		body = ui.RenderProcessTable(m.styles, m.width, m.height, "Memory Processes", m.filteredMemory(), m.selectedMem, "RSS", m.processFilter)
+		body = ui.RenderProcessTable(m.styles, m.width, m.height, "Memory Processes", m.filteredMemory(), m.selectedMem, m.processFilter)
 	case domain.ViewNetwork:
 		body = ui.RenderConnections(m.styles, m.width, m.height, m.data.Connections, m.selectedConn)
 	case domain.ViewDiskBrowser:
-		body = ui.RenderDiskBrowser(m.styles, m.width, m.height, diskState)
+		body = ui.RenderDiskBrowser(m.styles, m.width, m.height, m.data.DiskUsage, diskState)
 	default:
 		body = ui.RenderDashboard(m.styles, m.width, int(m.focus), m.data, diskState)
 	}
@@ -321,8 +409,23 @@ func (m Model) View() tea.View {
 		)
 		body = lipgloss.JoinVertical(lipgloss.Left, confirm, "", body)
 	}
+	if m.cleanupConfirm {
+		confirm := m.styles.Focused.Width(min(max(44, m.width-12), 72)).Render(
+			m.styles.Warn.Render("Confirm Cleanup") + "\n\n" +
+				"This will run:\n" +
+				"brew cleanup -s\n" +
+				"go clean -cache -modcache\n" +
+				"docker system prune -f\n" +
+				"remove developer caches\n" +
+				"empty trash\n\n" +
+				"Press y to confirm, n to cancel, or esc to back out.",
+		)
+		body = lipgloss.JoinVertical(lipgloss.Left, confirm, "", body)
+	}
 	header := m.topBar()
-	body = lipgloss.JoinVertical(lipgloss.Left, header, "", body)
+	if header != "" {
+		body = lipgloss.JoinVertical(lipgloss.Left, header, "", body)
+	}
 	body += "\n\n" + m.styles.Dim.Render(m.status)
 	v := tea.NewView(m.styles.App.Width(m.width).Render(body))
 	v.AltScreen = true
@@ -349,11 +452,29 @@ func (m Model) refreshCmd() tea.Cmd {
 
 func (m Model) scanDirCmd(path string) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		node, err := m.scanner.Scan(ctx, path)
+		node, err := m.scanner.Scan(context.Background(), path)
 		return diskScanMsg{path: path, node: node, err: err}
 	}
+}
+
+func (m Model) rescanDirCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		node, err := m.scanner.ForceScan(context.Background(), path)
+		return diskScanMsg{path: path, node: node, err: err}
+	}
+}
+
+func (m Model) diskProgressCmd(path string) tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		progress, ok := m.scanner.Progress(path)
+		return diskProgressMsg{path: path, progress: progress, ok: ok}
+	})
+}
+
+func (m Model) cleanupProgressCmd() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		return cleanupProgressMsg{progress: m.cleanupRunner.Progress()}
+	})
 }
 
 func (m Model) actionCmd(pid int32, sig syscall.Signal, text string) tea.Cmd {
@@ -397,13 +518,14 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		m.diskPath = child.Path
 		m.selectedDisk = 0
 		m.diskLoading = true
+		m.diskProgress = domain.DiskScanProgress{}
 		if cached, ok := m.scanner.Cached(m.diskPath); ok {
 			m.diskNode = cached
 			m.diskLoading = false
 			return m, nil
 		}
 		m.diskNode = domain.DiskNode{Path: child.Path}
-		return m, m.scanDirCmd(child.Path)
+		return m, tea.Batch(m.scanDirCmd(child.Path), m.diskProgressCmd(child.Path))
 	default:
 		return m, nil
 	}
@@ -419,6 +541,7 @@ func (m Model) handleBack() (tea.Model, tea.Cmd) {
 	}
 	m.diskPath = parent
 	m.selectedDisk = 0
+	m.diskProgress = domain.DiskScanProgress{}
 	if cached, ok := m.scanner.Cached(parent); ok {
 		m.diskNode = cached
 		m.diskLoading = false
@@ -426,7 +549,7 @@ func (m Model) handleBack() (tea.Model, tea.Cmd) {
 	}
 	m.diskLoading = true
 	m.diskNode = domain.DiskNode{Path: parent}
-	return m, m.scanDirCmd(parent)
+	return m, tea.Batch(m.scanDirCmd(parent), m.diskProgressCmd(parent))
 }
 
 func (m *Model) move(delta int) {
@@ -698,6 +821,9 @@ func (m Model) refreshInterval() time.Duration {
 }
 
 func (m Model) topBar() string {
+	if m.view == domain.ViewDiskBrowser {
+		return "sysdash"
+	}
 	left := "sysdash"
 	if !m.hasFocus {
 		left += " [background]"
@@ -733,4 +859,14 @@ func topChildren(node domain.DiskNode, limit int) domain.DiskNode {
 		out.Children = out.Children[:limit]
 	}
 	return out
+}
+
+func cleanupFailures(results []domain.CleanupStepResult) int {
+	var failures int
+	for _, result := range results {
+		if !result.OK {
+			failures++
+		}
+	}
+	return failures
 }
