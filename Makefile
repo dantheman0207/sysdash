@@ -4,7 +4,7 @@ GOCACHE := $(CURDIR)/.cache/go-build
 GOMODCACHE := $(CURDIR)/.cache/go-mod
 GOENV := GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
 
-.PHONY: build tidy run clean
+.PHONY: build tidy run clean release-snapshot
 
 build:
 	mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE)
@@ -20,3 +20,7 @@ run:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+release-snapshot:
+	mkdir -p $(GOCACHE) $(GOMODCACHE)
+	env $(GOENV) goreleaser release --snapshot --clean

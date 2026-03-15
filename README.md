@@ -56,6 +56,12 @@ go build ./...
 go run .
 ```
 
+## Version
+
+```bash
+go run . --version
+```
+
 The app is intended for macOS Apple Silicon. On macOS, the network drill-down uses `lsof` for process-owned connections because per-process network throughput attribution is out of scope for this MVP.
 
 ## Keys
@@ -76,3 +82,43 @@ The app is intended for macOS Apple Silicon. On macOS, the network drill-down us
 - Root-level scans can still take time on large systems, but they run asynchronously, show progress, and cache completed paths.
 - The disk cleanup workflow runs `brew cleanup -s`, `go clean -cache -modcache`, `docker system prune -f`, removes selected developer caches, and empties Trash, then reports free-space change.
 - The app uses a 1-second heartbeat, refreshes data every 2 seconds while focused, and every 30 seconds while unfocused.
+
+## Homebrew Release Flow
+
+This repo is configured for GoReleaser to publish a macOS Apple Silicon release and update a Homebrew tap.
+
+### One-time setup
+
+1. Create a tap repo named `dantheman0207/homebrew-tools`.
+2. Create a GitHub fine-grained token that can:
+   - write to this repo's releases
+   - push commits to `dantheman0207/homebrew-tools`
+3. Add that token to this repo as the GitHub Actions secret `HOMEBREW_TAP_GITHUB_TOKEN`.
+
+### Local snapshot test
+
+```bash
+brew install goreleaser
+make release-snapshot
+```
+
+### Publish a release
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The GitHub Actions workflow in [release.yml](/Users/daniel/Projects/sysdash/.github/workflows/release.yml) will:
+
+- build the `darwin/arm64` release archive
+- publish the GitHub Release
+- update the `sysdash` formula in `dantheman0207/homebrew-tools`
+
+### User install flow
+
+```bash
+brew tap dantheman0207/tools
+brew install sysdash
+brew upgrade sysdash
+```

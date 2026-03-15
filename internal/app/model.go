@@ -24,6 +24,7 @@ import (
 )
 
 type focusWidget int
+type processSortKey string
 
 const (
 	focusCPU focusWidget = iota
@@ -32,6 +33,11 @@ const (
 	focusNetwork
 	focusDiskBrowser
 	focusCount
+
+	sortCPU  processSortKey = "cpu"
+	sortRSS  processSortKey = "rss"
+	sortPID  processSortKey = "pid"
+	sortName processSortKey = "name"
 )
 
 type tickMsg struct{}
@@ -61,6 +67,7 @@ const (
 	heartbeatInterval        = 1 * time.Second
 	focusedRefreshInterval   = 2 * time.Second
 	unfocusedRefreshInterval = 30 * time.Second
+	sparklineHistoryLimit    = 20
 )
 
 type keyMap struct {
@@ -118,10 +125,18 @@ type Model struct {
 	help           help.Model
 	status         string
 	nextRefreshAt  time.Time
+	cpuHistory     []float64
+	memHistory     []float64
+	diskReadHist   []float64
+	diskWriteHist  []float64
+	netRXHist      []float64
+	netTXHist      []float64
 	selectedCPU    int
 	selectedMem    int
 	selectedConn   int
 	selectedDisk   int
+	cpuSort        processSortKey
+	memSort        processSortKey
 	processFilter  string
 	diskPath       string
 	diskNode       domain.DiskNode
@@ -129,6 +144,8 @@ type Model struct {
 	diskProgress   domain.DiskScanProgress
 	cleanupConfirm bool
 	cleanupState   domain.CleanupProgress
+	detailOpen     bool
+	detailProcess  domain.ProcessInfo
 	actionMenuPID  int32
 	actionMenuName string
 	confirmPID     int32
@@ -150,6 +167,8 @@ func New() Model {
 		keys:          newKeyMap(),
 		help:          h,
 		status:        "loading...",
+		cpuSort:       sortCPU,
+		memSort:       sortRSS,
 		diskPath:      "/",
 		nextRefreshAt: time.Now().Add(focusedRefreshInterval),
 	}
@@ -187,6 +206,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.data = msg.data
+		m.recordSparklineData(msg.data)
 		m.status = fmt.Sprintf("updated %s", msg.data.Timestamp.Format("15:04:05"))
 		return m, nil
 	case diskScanMsg:
@@ -247,6 +267,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		if key.Matches(msg, m.keys.Quit) {
 			return m, tea.Quit
+		}
+		if m.detailOpen {
+			switch {
+			case key.Matches(msg, m.keys.Enter):
+				m.actionMenuPID = m.detailProcess.PID
+				m.actionMenuName = m.detailProcess.Name
+				m.detailOpen = false
+				m.status = fmt.Sprintf("selected pid %d", m.actionMenuPID)
+				return m, nil
+			case key.Matches(msg, m.keys.Esc):
+				m.detailOpen = false
+				m.status = "closed process details"
+				return m, nil
+			default:
+				return m, nil
+			}
 		}
 		if m.cleanupConfirm {
 			switch {
@@ -314,11 +350,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Tab):
 			if m.view == domain.ViewDashboard {
 				m.focus = (m.focus + 1) % focusCount
+			} else if m.view == domain.ViewCPU || m.view == domain.ViewMemory {
+				m.cycleProcessSort(1)
 			}
 			return m, nil
 		case key.Matches(msg, m.keys.BackTab):
 			if m.view == domain.ViewDashboard {
 				m.focus = (m.focus - 1 + focusCount) % focusCount
+			} else if m.view == domain.ViewCPU || m.view == domain.ViewMemory {
+				m.cycleProcessSort(-1)
 			}
 			return m, nil
 		case key.Matches(msg, m.keys.Left):
@@ -378,17 +418,25 @@ func (m Model) View() tea.View {
 		Progress: m.diskProgress,
 		Cleanup:  m.cleanupState,
 	}
+	history := ui.DashboardHistory{
+		CPU:       m.cpuHistory,
+		Memory:    m.memHistory,
+		DiskRead:  m.diskReadHist,
+		DiskWrite: m.diskWriteHist,
+		NetRX:     m.netRXHist,
+		NetTX:     m.netTXHist,
+	}
 	switch m.view {
 	case domain.ViewCPU:
-		body = ui.RenderProcessTable(m.styles, m.width, m.height, "CPU Processes", m.filteredCPU(), m.selectedCPU, m.processFilter)
+		body = ui.RenderProcessTable(m.styles, m.width, m.height, "CPU Processes", m.filteredCPU(), m.selectedCPU, m.processFilter, processSortLabel(m.cpuSort))
 	case domain.ViewMemory:
-		body = ui.RenderProcessTable(m.styles, m.width, m.height, "Memory Processes", m.filteredMemory(), m.selectedMem, m.processFilter)
+		body = ui.RenderProcessTable(m.styles, m.width, m.height, "Memory Processes", m.filteredMemory(), m.selectedMem, m.processFilter, processSortLabel(m.memSort))
 	case domain.ViewNetwork:
 		body = ui.RenderConnections(m.styles, m.width, m.height, m.data.Connections, m.selectedConn)
 	case domain.ViewDiskBrowser:
 		body = ui.RenderDiskBrowser(m.styles, m.width, m.height, m.data.DiskUsage, diskState)
 	default:
-		body = ui.RenderDashboard(m.styles, m.width, int(m.focus), m.data, diskState)
+		body = ui.RenderDashboard(m.styles, m.width, int(m.focus), m.data, diskState, history)
 	}
 
 	if m.actionMenuPID != 0 {
@@ -399,6 +447,21 @@ func (m Model) View() tea.View {
 				"Press 1-4 to choose, or esc to cancel.",
 		)
 		body = lipgloss.JoinVertical(lipgloss.Left, menu, "", body)
+	}
+	if m.detailOpen {
+		detail := m.styles.Focused.Width(min(max(52, m.width-12), 96)).Render(
+			m.styles.Warn.Render("Process Details") + "\n\n" +
+				fmt.Sprintf("Name     %s\n", m.detailProcess.Name) +
+				fmt.Sprintf("PID      %d\n", m.detailProcess.PID) +
+				fmt.Sprintf("User     %s\n", blankIfEmpty(m.detailProcess.User)) +
+				fmt.Sprintf("State    %s\n", blankIfEmpty(m.detailProcess.Status)) +
+				fmt.Sprintf("CPU      %s\n", ui.CPUString(m.detailProcess.CPU)) +
+				fmt.Sprintf("RSS      %s\n", ui.ByteString(m.detailProcess.RSS)) +
+				fmt.Sprintf("Threads  %d\n\n", m.detailProcess.Threads) +
+				fmt.Sprintf("Command  %s\n\n", blankIfEmpty(m.detailProcess.Cmdline)) +
+				"Press enter for actions, or esc to close.",
+		)
+		body = lipgloss.JoinVertical(lipgloss.Left, detail, "", body)
 	}
 	if m.confirmPID != 0 {
 		confirm := m.styles.Focused.Width(min(max(44, m.width-12), 72)).Render(
@@ -502,8 +565,8 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	case domain.ViewCPU, domain.ViewMemory:
 		if proc, ok := m.currentProcess(); ok {
-			m.actionMenuPID = proc.PID
-			m.actionMenuName = proc.Name
+			m.detailOpen = true
+			m.detailProcess = proc
 			m.status = fmt.Sprintf("selected pid %d", proc.PID)
 		}
 		return m, nil
@@ -643,6 +706,8 @@ func moveDashboardFocus(curr focusWidget, dir string) focusWidget {
 		switch dir {
 		case "right":
 			return focusMemory
+		case "up":
+			return focusDiskBrowser
 		case "down":
 			return focusDiskIO
 		}
@@ -650,7 +715,7 @@ func moveDashboardFocus(curr focusWidget, dir string) focusWidget {
 		switch dir {
 		case "left":
 			return focusCPU
-		case "right":
+		case "up":
 			return focusDiskBrowser
 		case "down":
 			return focusNetwork
@@ -668,11 +733,10 @@ func moveDashboardFocus(curr focusWidget, dir string) focusWidget {
 			return focusMemory
 		case "left":
 			return focusDiskIO
-		case "right":
-			return focusDiskBrowser
 		}
 	case focusDiskBrowser:
-		if dir == "left" {
+		switch dir {
+		case "down":
 			return focusMemory
 		}
 	}
@@ -724,11 +788,11 @@ func (m Model) filteredProcessCount() int {
 }
 
 func (m Model) filteredCPU() []domain.ProcessInfo {
-	return filterProcesses(m.data.TopCPU, m.processFilter)
+	return sortProcesses(filterProcesses(m.data.TopCPU, m.processFilter), m.cpuSort)
 }
 
 func (m Model) filteredMemory() []domain.ProcessInfo {
-	return filterProcesses(m.data.TopMemory, m.processFilter)
+	return sortProcesses(filterProcesses(m.data.TopMemory, m.processFilter), m.memSort)
 }
 
 func filterProcesses(in []domain.ProcessInfo, query string) []domain.ProcessInfo {
@@ -774,6 +838,20 @@ func (m Model) isReservedProcessKey(msg tea.KeyPressMsg) bool {
 		m.keys.Esc,
 		m.keys.Quit,
 	)
+}
+
+func (m *Model) cycleProcessSort(delta int) {
+	order := []processSortKey{sortCPU, sortRSS, sortPID, sortName}
+	switch m.view {
+	case domain.ViewCPU:
+		m.cpuSort = nextProcessSort(m.cpuSort, order, delta)
+		m.selectedCPU = clamp(m.selectedCPU, len(m.filteredCPU()))
+		m.status = "sort: " + processSortLabel(m.cpuSort)
+	case domain.ViewMemory:
+		m.memSort = nextProcessSort(m.memSort, order, delta)
+		m.selectedMem = clamp(m.selectedMem, len(m.filteredMemory()))
+		m.status = "sort: " + processSortLabel(m.memSort)
+	}
 }
 
 func (m Model) handleActionMenu(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -869,4 +947,77 @@ func cleanupFailures(results []domain.CleanupStepResult) int {
 		}
 	}
 	return failures
+}
+
+func (m *Model) recordSparklineData(data domain.DashboardData) {
+	m.cpuHistory = appendSparklinePoint(m.cpuHistory, data.CPUPercent)
+	m.memHistory = appendSparklinePoint(m.memHistory, data.Memory.UsedPercent)
+	m.diskReadHist = appendSparklinePoint(m.diskReadHist, float64(data.DiskIO.ReadBytesPerSec))
+	m.diskWriteHist = appendSparklinePoint(m.diskWriteHist, float64(data.DiskIO.WriteBytesPerSec))
+	m.netRXHist = appendSparklinePoint(m.netRXHist, float64(data.Network.ReadBytesPerSec))
+	m.netTXHist = appendSparklinePoint(m.netTXHist, float64(data.Network.WriteBytesPerSec))
+}
+
+func appendSparklinePoint(history []float64, value float64) []float64 {
+	history = append(history, value)
+	if len(history) > sparklineHistoryLimit {
+		history = history[len(history)-sparklineHistoryLimit:]
+	}
+	return history
+}
+
+func sortProcesses(in []domain.ProcessInfo, key processSortKey) []domain.ProcessInfo {
+	out := append([]domain.ProcessInfo(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		switch key {
+		case sortRSS:
+			if out[i].RSS == out[j].RSS {
+				return out[i].PID < out[j].PID
+			}
+			return out[i].RSS > out[j].RSS
+		case sortPID:
+			return out[i].PID < out[j].PID
+		case sortName:
+			if out[i].Name == out[j].Name {
+				return out[i].PID < out[j].PID
+			}
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		default:
+			if out[i].CPU == out[j].CPU {
+				return out[i].PID < out[j].PID
+			}
+			return out[i].CPU > out[j].CPU
+		}
+	})
+	return out
+}
+
+func nextProcessSort(current processSortKey, order []processSortKey, delta int) processSortKey {
+	for i, key := range order {
+		if key == current {
+			next := (i + delta + len(order)) % len(order)
+			return order[next]
+		}
+	}
+	return order[0]
+}
+
+func processSortLabel(key processSortKey) string {
+	switch key {
+	case sortRSS:
+		return "RSS desc"
+	case sortPID:
+		return "PID asc"
+	case sortName:
+		return "Name asc"
+	default:
+		return "CPU desc"
+	}
+}
+
+func blankIfEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
 }

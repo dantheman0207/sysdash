@@ -1,0 +1,55 @@
+version: 2
+
+project_name: sysdash
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: sysdash-darwin
+    main: .
+    binary: sysdash
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/daniel/sysdash/internal/version.Version={{ .Version }}
+      - -X github.com/daniel/sysdash/internal/version.Commit={{ .Commit }}
+      - -X github.com/daniel/sysdash/internal/version.Date={{ .Date }}
+
+archives:
+  - id: sysdash
+    ids:
+      - sysdash-darwin
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  use: git
+
+brews:
+  - name: sysdash
+    repository:
+      owner: dantheman0207
+      name: homebrew-tools
+      branch: main
+    directory: Formula
+    homepage: https://github.com/dantheman0207/sysdash
+    description: Keyboard-driven macOS system dashboard
+    skip_upload: auto
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/sysdash --version")
+    install: |
+      bin.install "sysdash"
+

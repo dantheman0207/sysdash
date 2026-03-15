@@ -19,6 +19,7 @@ import (
 type CleanupRunner struct {
 	mu       sync.RWMutex
 	progress domain.CleanupProgress
+	history  []domain.CleanupRunSummary
 }
 
 type cleanupStep struct {
@@ -35,6 +36,7 @@ func (r *CleanupRunner) Progress() domain.CleanupProgress {
 	defer r.mu.RUnlock()
 	out := r.progress
 	out.Results = append([]domain.CleanupStepResult(nil), out.Results...)
+	out.History = append([]domain.CleanupRunSummary(nil), r.history...)
 	return out
 }
 
@@ -52,6 +54,7 @@ func (r *CleanupRunner) Start(ctx context.Context) error {
 		StartedAt:  time.Now(),
 		BeforeFree: beforeFree,
 		Results:    make([]domain.CleanupStepResult, 0, 5),
+		History:    append([]domain.CleanupRunSummary(nil), r.history...),
 	}
 	r.mu.Unlock()
 
@@ -97,6 +100,16 @@ func (r *CleanupRunner) run(ctx context.Context) {
 	if r.progress.AfterFree > r.progress.BeforeFree {
 		r.progress.SavedBytes = r.progress.AfterFree - r.progress.BeforeFree
 	}
+	run := domain.CleanupRunSummary{
+		FinishedAt: r.progress.FinishedAt,
+		SavedBytes: r.progress.SavedBytes,
+		Failures:   cleanupFailures(r.progress.Results),
+	}
+	r.history = append([]domain.CleanupRunSummary{run}, r.history...)
+	if len(r.history) > 5 {
+		r.history = r.history[:5]
+	}
+	r.progress.History = append([]domain.CleanupRunSummary(nil), r.history...)
 }
 
 func (r *CleanupRunner) setCurrent(name string, completed int) {
@@ -197,4 +210,14 @@ func emptyTrash(context.Context) error {
 		return fmt.Errorf(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func cleanupFailures(results []domain.CleanupStepResult) int {
+	var failures int
+	for _, result := range results {
+		if !result.OK {
+			failures++
+		}
+	}
+	return failures
 }

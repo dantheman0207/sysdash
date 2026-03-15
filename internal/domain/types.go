@@ -98,6 +98,12 @@ type CleanupStepResult struct {
 	Ended   time.Time
 }
 
+type CleanupRunSummary struct {
+	FinishedAt time.Time
+	SavedBytes uint64
+	Failures   int
+}
+
 type CleanupProgress struct {
 	Running     bool
 	Done        bool
@@ -110,4 +116,5 @@ type CleanupProgress struct {
 	AfterFree   uint64
 	SavedBytes  uint64
 	Results     []CleanupStepResult
+	History     []CleanupRunSummary
 }
