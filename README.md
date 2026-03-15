@@ -56,6 +56,19 @@ go build ./...
 go run .
 ```
 
+## Install
+
+```bash
+brew tap dantheman0207/tools
+brew install sysdash
+```
+
+To remove the tap later:
+
+```bash
+brew untap dantheman0207/tools
+```
+
 ## Version
 
 ```bash
@@ -122,3 +135,5 @@ brew tap dantheman0207/tools
 brew install sysdash
 brew upgrade sysdash
 ```
+
+The reusable release checklist is in [docs/HOMEBREW_RELEASES.md](/Users/daniel/Projects/sysdash/docs/HOMEBREW_RELEASES.md).
