@@ -65,10 +65,13 @@ func (r *CleanupRunner) Start(ctx context.Context) error {
 func (r *CleanupRunner) run(ctx context.Context) {
 	steps := []cleanupStep{
 		{name: "go clean -cache -modcache", run: func(ctx context.Context) error { return runCommand(ctx, "go", "clean", "-cache", "-modcache") }},
-		{name: "remove developer caches", run: removeDeveloperCaches},
+		{name: "remove developer and user caches", run: removeDeveloperCaches},
 		{name: "empty trash", run: emptyTrash},
-		{name: "docker system prune -f", run: func(ctx context.Context) error { return runCommand(ctx, "docker", "system", "prune", "-f") }},
 		{name: "brew cleanup -s", run: func(ctx context.Context) error { return runCommand(ctx, "brew", "cleanup", "-s") }},
+		{name: "docker system prune -f (best effort)", run: func(ctx context.Context) error {
+			_ = runCommand(ctx, "docker", "system", "prune", "-f")
+			return nil
+		}},
 	}
 
 	for i, step := range steps {
@@ -158,7 +161,8 @@ func removeDeveloperCaches(context.Context) error {
 	paths := []string{
 		filepath.Join(home, "Library/Developer/Xcode/DerivedData"),
 		filepath.Join(home, "Library/Developer/CoreSimulator/Caches"),
-		filepath.Join(home, "Library/Caches/org.swift.swiftpm"),
+		filepath.Join(home, "Library/Caches"),
+		filepath.Join(home, ".cache"),
 	}
 	var errs []string
 	for _, path := range paths {
@@ -167,7 +171,7 @@ func removeDeveloperCaches(context.Context) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -207,7 +211,7 @@ func emptyTrash(context.Context) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
 }

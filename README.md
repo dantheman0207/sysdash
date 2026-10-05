@@ -93,7 +93,7 @@ The app is intended for macOS Apple Silicon. On macOS, the network drill-down us
 
 - The disk browser scanner avoids crossing device boundaries, skips symlinks, and treats Darwin `SF_DATALESS` cloud placeholders as zero local bytes.
 - Root-level scans can still take time on large systems, but they run asynchronously, show progress, and cache completed paths.
-- The disk cleanup workflow runs `brew cleanup -s`, `go clean -cache -modcache`, `docker system prune -f`, removes selected developer caches, and empties Trash, then reports free-space change.
+- The disk cleanup workflow runs `go clean -cache -modcache`, deletes Xcode DerivedData, CoreSimulator caches, `~/Library/Caches`, and `~/.cache`, empties Trash, then runs `brew cleanup -s` followed by `docker system prune -f`. Docker errors are ignored. It reports the free-space change after all steps.
 - The app uses a 1-second heartbeat, refreshes data every 2 seconds while focused, and every 30 seconds while unfocused.
 
 ## Homebrew Release Flow

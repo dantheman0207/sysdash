@@ -476,11 +476,12 @@ func (m Model) View() tea.View {
 		confirm := m.styles.Focused.Width(min(max(44, m.width-12), 72)).Render(
 			m.styles.Warn.Render("Confirm Cleanup") + "\n\n" +
 				"This will run:\n" +
-				"brew cleanup -s\n" +
 				"go clean -cache -modcache\n" +
-				"docker system prune -f\n" +
-				"remove developer caches\n" +
-				"empty trash\n\n" +
+				"remove Xcode and simulator caches\n" +
+				"delete ~/Library/Caches and ~/.cache\n" +
+				"empty trash\n" +
+				"brew cleanup -s\n" +
+				"docker system prune -f (best effort)\n\n" +
 				"Press y to confirm, n to cancel, or esc to back out.",
 		)
 		body = lipgloss.JoinVertical(lipgloss.Left, confirm, "", body)
