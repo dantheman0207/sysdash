@@ -87,6 +87,7 @@ The app is intended for macOS Apple Silicon. On macOS, the network drill-down us
 - printable typing in CPU/memory views: filter the process list
 - `f5`: refresh immediately, or rescan the current folder in the disk browser
 - `f6`: open disk cleanup confirmation in the full disk browser
+- `f7`: open the current folder in Finder in the full disk browser
 - `ctrl+c`: quit
 
 ## Notes

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -83,6 +84,7 @@ type keyMap struct {
 	Bottom  key.Binding
 	Refresh key.Binding
 	Cleanup key.Binding
+	Finder  key.Binding
 	Quit    key.Binding
 	Back    key.Binding
 	Yes     key.Binding
@@ -103,6 +105,7 @@ func newKeyMap() keyMap {
 		Bottom:  key.NewBinding(key.WithKeys("end")),
 		Refresh: key.NewBinding(key.WithKeys("f5")),
 		Cleanup: key.NewBinding(key.WithKeys("f6")),
+		Finder:  key.NewBinding(key.WithKeys("f7")),
 		Quit:    key.NewBinding(key.WithKeys("ctrl+c")),
 		Back:    key.NewBinding(key.WithKeys("backspace", "ctrl+h")),
 		Yes:     key.NewBinding(key.WithKeys("y")),
@@ -337,6 +340,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.refreshCmd(), m.rescanDirCmd(m.diskPath), m.diskProgressCmd(m.diskPath))
 			}
 			return m, tea.Batch(m.refreshCmd(), m.scanDirCmd(m.diskPath))
+		case key.Matches(msg, m.keys.Finder):
+			if m.view == domain.ViewDiskBrowser {
+				path := m.diskPath
+				return m, func() tea.Msg {
+					err := exec.Command("/usr/bin/open", "-a", "Finder", path).Run()
+					return actionMsg{text: "opened " + path + " in Finder", err: err}
+				}
+			}
+			return m, nil
 		case key.Matches(msg, m.keys.Cleanup):
 			if m.view == domain.ViewDiskBrowser {
 				if m.cleanupState.Running {

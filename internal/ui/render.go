@@ -170,7 +170,8 @@ func RenderDiskBrowser(styles Styles, width, height int, usage domain.DiskUsage,
 	}
 	lines = append(lines, "")
 	lines = append(lines, styles.Dim.Render(fmt.Sprintf("rows %d-%d of %d", start+1, max(start+1, end), len(state.Node.Children))))
-	lines = append(lines, styles.Dim.Render("enter/right descend  backspace/left up  f5 rescan current folder  f6 cleanup  percentages are of scanned path total"))
+	lines = append(lines, styles.Dim.Render("enter/right descend  backspace/left up  f5 rescan current folder  f6 cleanup  f7 open current folder in Finder"))
+	lines = append(lines, styles.Dim.Render("percentages are of scanned path total"))
 	return strings.Join(lines, "\n")
 }
 
